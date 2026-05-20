@@ -71,6 +71,17 @@ void cp_gather_and_upconvert_fp8_kv_cache(
     torch::Tensor const& workspace_starts,  // [BATCH]
     int64_t batch_size);
 
+// Gather/dequant FP8 KV cache into [B, T, 576] BF16 output with per-request
+// windowing support.
+void cp_gather_and_upconvert_fp8_kv_cache_windowed(
+    torch::Tensor const& src_cache,      // [NUM_BLOCKS, BLOCK_SIZE, 656]
+    torch::Tensor const& out,            // [BATCH, MAX_TOKENS, 512] bf16
+    torch::Tensor const& block_table,    // [BATCH, BLOCK_INDICES]
+    torch::Tensor const& seq_lens,       // [BATCH]
+    torch::Tensor const& gather_lens,    // [BATCH]
+    torch::Tensor const& workspace_starts,  // [BATCH]
+    int64_t offset);
+
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(
     torch::Tensor& k,             // [num_tokens, head_dim]

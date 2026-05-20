@@ -25,6 +25,7 @@
 
 #include "kernel.h"
 #include "core/registration.h"
+#include <c10/cuda/CUDAException.h>
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -865,6 +866,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
       is_zp_float);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return c;
 }

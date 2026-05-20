@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -29,7 +30,11 @@ from vllm.models.deepseek_v4.common.ops import (
 )
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    rocm_inv_rope_einsum,
+    rocm_sparse_attn_decode,
+    rocm_sparse_attn_prefill,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -205,12 +210,23 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         assert cap is not None, "DeepseekV4 attention requires a CUDA device"
         self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
         self._tma_aligned_scales = cap.major >= 10
+        self._sm89_serial_compressor = (
+            cap.major == 8
+            and cap.minor == 9
+            and os.getenv("VLLM_SM89_SERIAL_COMPRESSOR", "0") == "1"
+        )
 
         self.rotary_emb = mla_modules.rotary_emb
         self.indexer_rotary_emb = mla_modules.indexer_rotary_emb
         self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
         self.indexer = mla_modules.indexer
+
+        if self._sm89_serial_compressor:
+            logger.info(
+                "SM89 serial compressor scheduling enabled "
+                "(VLLM_SM89_SERIAL_COMPRESSOR=1)."
+            )
 
         # Per-head RMS normalization for Q (no learnable weights)
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
@@ -440,6 +456,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
+            if self._sm89_serial_compressor:
+                aux_stream = None
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -470,6 +488,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
+            if self._sm89_serial_compressor:
+                aux_stream = None
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -731,6 +751,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             return DeepseekV4ROCMAiterMLASparseBackend
         return DeepseekV4FlashMLASparseBackend
 
+    @staticmethod
+    def _use_sm89_sparse_triton() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        major, minor = torch.cuda.get_device_capability()
+        return major == 8 and minor == 9
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         if (
             self.compress_ratio <= 1
@@ -851,9 +878,37 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
-        # We treat queries in the same seq as different queries
-        # and later we only attend by generated indices.
-        # q arrives pre-padded to self.padded_heads by the outer wrapper.
+        if self._use_sm89_sparse_triton():
+            topk_indices_dense = (
+                topk_indices.reshape(num_decode_tokens, -1)
+                if topk_indices is not None
+                else None
+            )
+            rocm_sparse_attn_decode(
+                q=q,
+                kv_cache=kv_cache,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                swa_only=swa_only,
+                topk_indices=topk_indices_dense,
+                topk_lens=topk_lens,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                swa_ragged_indices=None,
+                swa_ragged_indptr=None,
+                topk_ragged_indices=None,
+                topk_ragged_indptr=None,
+                attn_sink=self.attn_sink,
+                scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+                output=output,
+            )
+            return
+
+        # We treat queries in the same seq as different queries and later we
+        # only attend by generated indices. q arrives pre-padded to
+        # self.padded_heads by the outer wrapper.
         q = q.unsqueeze(1)
 
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
@@ -1014,15 +1069,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 M,
                 N,
             )
-            flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            if self._use_sm89_sparse_triton():
+                rocm_sparse_attn_prefill(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices,
+                    topk_length=combined_lens,
+                    scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    attn_sink=self.attn_sink,
+                    output=output[query_start:query_end],
+                )
+            else:
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

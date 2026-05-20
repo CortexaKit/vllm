@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -52,6 +53,49 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _maybe_validate_marlin_moe_inputs(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    global_num_experts: int,
+) -> None:
+    if os.environ.get("VLLM_MOE_INPUT_CONTRACT_CHECK", "0") != "1":
+        return
+
+    if topk_ids.shape != topk_weights.shape:
+        raise RuntimeError(
+            f"Marlin MoE topk shape mismatch: ids={topk_ids.shape}, "
+            f"weights={topk_weights.shape}"
+        )
+    if topk_ids.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError(
+            f"Marlin MoE token mismatch: hidden_states={hidden_states.shape}, "
+            f"topk_ids={topk_ids.shape}"
+        )
+    if not topk_ids.dtype.is_signed:
+        raise RuntimeError(f"Marlin MoE topk_ids must be signed, got {topk_ids.dtype}")
+    if topk_weights.dtype != torch.float32:
+        raise RuntimeError(
+            f"Marlin MoE topk_weights must be float32, got {topk_weights.dtype}"
+        )
+
+    min_id, max_id = torch.aminmax(topk_ids)
+    min_id_v = int(min_id.item())
+    max_id_v = int(max_id.item())
+    max_expected = max(global_num_experts, num_local_experts) - 1
+    if min_id_v < -1 or max_id_v > max_expected:
+        raise RuntimeError(
+            f"Marlin MoE topk_ids out of range: min={min_id_v}, max={max_id_v}, "
+            f"max_expected={max_expected}"
+        )
+
+    if not torch.isfinite(hidden_states).all():
+        raise RuntimeError("Marlin MoE hidden_states contains NaN/Inf")
+    if not torch.isfinite(topk_weights).all():
+        raise RuntimeError("Marlin MoE topk_weights contains NaN/Inf")
 
 
 def _fused_marlin_moe(
@@ -331,6 +375,13 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    _maybe_validate_marlin_moe_inputs(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        num_local_experts=E,
+        global_num_experts=global_num_experts,
+    )
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
         block_size_m,

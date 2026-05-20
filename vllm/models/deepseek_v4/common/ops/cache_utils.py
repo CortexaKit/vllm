@@ -16,6 +16,7 @@ preparation.
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
@@ -364,7 +365,38 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    if has_cutedsl():
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        # Prefer dedicated CUDA kernel on SM89 to avoid Triton/cutedsl
+        # instability and keep high-throughput gather+dequant.
+        if major == 8:
+            effective_gather_lens = seq_lens if gather_lens is None else gather_lens
+            # workspace_starts[b] = sum_{i < b} gather_len[i]
+            workspace_starts = torch.empty_like(effective_gather_lens)
+            if workspace_starts.numel() > 0:
+                workspace_starts[0] = 0
+                if workspace_starts.numel() > 1:
+                    workspace_starts[1:] = torch.cumsum(
+                        effective_gather_lens[:-1], dim=0
+                    )
+            ops.cp_gather_and_upconvert_fp8_kv_cache_windowed(
+                k_cache,
+                out,
+                block_table,
+                seq_lens,
+                effective_gather_lens,
+                workspace_starts,
+                offset,
+            )
+            return
+
+    use_cutedsl = False
+    if has_cutedsl() and torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        # cutedsl dequant-gather kernels currently require Hopper+ instructions.
+        use_cutedsl = major >= 9
+
+    if use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

@@ -2799,6 +2799,21 @@ def cp_gather_and_upconvert_fp8_kv_cache(
     )
 
 
+def cp_gather_and_upconvert_fp8_kv_cache_windowed(
+    src_cache: torch.Tensor,
+    out: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    workspace_starts: torch.Tensor,
+    offset: int,
+) -> None:
+    """Windowed gather+upconvert for fp8_ds_mla cache into [B, T, 576] BF16."""
+    torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache_windowed(
+        src_cache, out, block_table, seq_lens, gather_lens, workspace_starts, offset
+    )
+
+
 def concat_mla_q(
     ql_nope: torch.Tensor,
     q_pe: torch.Tensor,

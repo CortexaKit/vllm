@@ -429,6 +429,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "batch_size) -> ()");
   cache_ops.impl("cp_gather_and_upconvert_fp8_kv_cache", torch::kCUDA,
                  &cp_gather_and_upconvert_fp8_kv_cache);
+  cache_ops.def(
+      "cp_gather_and_upconvert_fp8_kv_cache_windowed("
+      "Tensor src_cache, Tensor! out, Tensor block_table, Tensor seq_lens, "
+      "Tensor gather_lens, Tensor workspace_starts, int offset) -> ()");
+  cache_ops.impl("cp_gather_and_upconvert_fp8_kv_cache_windowed", torch::kCUDA,
+                 &cp_gather_and_upconvert_fp8_kv_cache_windowed);
 
   cache_ops.def(
       "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache, Tensor "

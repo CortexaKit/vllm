@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _mhc_allow_pdl_fused_small_tokens(device: torch.device) -> bool:
+    # Ada (sm89) does not support the PDL behavior used by mhc_fused_tilelang.
+    # Keep an override for debugging new compiler/runtime stacks.
+    if os.getenv("VLLM_MHC_FORCE_ENABLE_PDL", "0") == "1":
+        return True
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 9
 
 
 def mhc_pre_tilelang(
@@ -69,7 +80,6 @@ def mhc_pre_tilelang(
     block_k = 64
     block_m = 64
     n_splits = compute_num_split(block_k, hc_hidden_size, cdiv(num_tokens, block_m))
-
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
@@ -252,7 +262,11 @@ def mhc_fused_post_pre_tilelang(
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     fma_token_threshold = 16
-    if num_tokens <= fma_token_threshold:
+    use_pdl_fused_small_tokens = (
+        num_tokens <= fma_token_threshold
+        and _mhc_allow_pdl_fused_small_tokens(residual.device)
+    )
+    if use_pdl_fused_small_tokens:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
@@ -261,7 +275,6 @@ def mhc_fused_post_pre_tilelang(
         block_k = 64
         block_m = 64
         n_splits = compute_num_split(block_k, hc_hidden_size, cdiv(num_tokens, block_m))
-
     gemm_out_mul = torch.empty(
         n_splits,
         num_tokens,
@@ -295,7 +308,7 @@ def mhc_fused_post_pre_tilelang(
         device=residual.device,
     )
 
-    if num_tokens <= fma_token_threshold:
+    if use_pdl_fused_small_tokens:
         mhc_fused_tilelang(
             comb_res_mix_flat,
             residual_flat,

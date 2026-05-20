@@ -124,7 +124,8 @@ define_extension_target(
   LANGUAGE CXX
   SOURCES ${VLLM_SPINLOOP_EXT_SRC}
   COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
-  USE_SABI 3.11
+  # spinloop.cpp uses Py_buffer / PyBuffer_Release, which are not available
+  # under the limited stable ABI. Build this extension against full CPython ABI.
   WITH_SOABI)
 
 #

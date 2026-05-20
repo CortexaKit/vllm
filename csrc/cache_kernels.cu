@@ -1200,6 +1200,79 @@ __global__ void cp_gather_and_upconvert_fp8_kv_cache(
   rope_dst[lane_id] = rope_src[lane_id];
 }
 
+__global__ void cp_gather_and_upconvert_fp8_kv_cache_windowed(
+    const uint8_t* __restrict__ src_cache,    // [NUM_BLOCKS, BLOCK_STRIDE_BYTES]
+    __nv_bfloat16* __restrict__ out,          // [BATCH, MAX_TOKENS, 512]
+    const int32_t* __restrict__ block_table,  // [BATCH, BLOCK_INDICES]
+    const int32_t* __restrict__ seq_lens,     // [BATCH]
+    const int32_t* __restrict__ gather_lens,  // [BATCH]
+    const int32_t* __restrict__ workspace_starts,  // [BATCH]
+    const int32_t num_reqs, const int32_t block_size,
+    const int32_t total_tokens, const int64_t block_table_stride,
+    const int64_t cache_block_stride, const int64_t out_stride0,
+    const int64_t out_stride1, const int32_t offset) {
+  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  if (flat_warp_id >= total_tokens) return;
+  const int lane_id = threadIdx.x & 31;
+
+  // Binary search to find which request owns this gathered token.
+  int lo = 0, hi = num_reqs - 1;
+  while (lo < hi) {
+    int mid = (lo + hi + 1) >> 1;
+    if (workspace_starts[mid] <= flat_warp_id)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const int req_id = lo;
+
+  const int gather_offset = flat_warp_id - workspace_starts[req_id];
+  const int seq_len = seq_lens[req_id];
+  const int gather_len = gather_lens[req_id];
+  const int seq_start = seq_len - gather_len;
+  const int token_pos = seq_start + gather_offset;
+
+  const int cache_block_idx = token_pos / block_size;
+  const int offset_in_block = token_pos % block_size;
+  const int physical_block =
+      block_table[req_id * block_table_stride + cache_block_idx];
+
+  // DeepSeek V4 FP8 DS_MLA layout:
+  // - Per-token data: 448 fp8 bytes + 64 bf16 values (128 bytes) = 576 bytes
+  // - Per-token scales: 8 uint8 exponents (7 used, 1 padding), stored in
+  //   scale region after all token data in the block.
+  constexpr int kFp8Dim = 448;
+  constexpr int kBf16Dim = 64;
+  constexpr int kTokenDataBytes = 576;
+  constexpr int kScaleBytesPerToken = 8;
+  constexpr int kQuantBlock = 64;
+
+  const uint8_t* block_ptr = src_cache + physical_block * cache_block_stride;
+  const uint8_t* token_data_ptr = block_ptr + offset_in_block * kTokenDataBytes;
+  const uint8_t* token_fp8_ptr = token_data_ptr;
+  const __nv_bfloat16* token_bf16_ptr =
+      reinterpret_cast<const __nv_bfloat16*>(token_data_ptr + kFp8Dim);
+  const uint8_t* token_scale_ptr = block_ptr + block_size * kTokenDataBytes +
+                                   offset_in_block * kScaleBytesPerToken;
+
+  __nv_bfloat16* out_ptr =
+      out + req_id * out_stride0 + (offset + gather_offset) * out_stride1;
+
+#pragma unroll
+  for (int idx = lane_id; idx < kFp8Dim; idx += 32) {
+    const uint8_t q = token_fp8_ptr[idx];
+    const uint8_t encoded_scale = token_scale_ptr[idx / kQuantBlock];
+    const float scale = exp2f(static_cast<float>(encoded_scale) - 127.0f);
+    out_ptr[idx] = fp8::scaled_convert<__nv_bfloat16, uint8_t,
+                                       Fp8KVCacheDataType::kFp8E4M3>(q, scale);
+  }
+
+#pragma unroll
+  for (int idx = lane_id; idx < kBf16Dim; idx += 32) {
+    out_ptr[kFp8Dim + idx] = token_bf16_ptr[idx];
+  }
+}
+
 template <typename scalar_t>
 // Note(hc): The cp_gather_cache allows seq_starts to no longer be divisible by
 // block_size.
@@ -1403,6 +1476,96 @@ void cp_gather_and_upconvert_fp8_kv_cache(
       static_cast<int32_t>(batch_size), block_size, total_tokens,
       block_table_stride, cache_block_stride, cache_entry_stride,
       dst_entry_stride);
+}
+
+void cp_gather_and_upconvert_fp8_kv_cache_windowed(
+    torch::Tensor const& src_cache,      // [NUM_BLOCKS, BLOCK_SIZE, 656]
+    torch::Tensor const& out,            // [BATCH, MAX_TOKENS, 512] bf16
+    torch::Tensor const& block_table,    // [BATCH, BLOCK_INDICES]
+    torch::Tensor const& seq_lens,       // [BATCH]
+    torch::Tensor const& gather_lens,    // [BATCH]
+    torch::Tensor const& workspace_starts,  // [BATCH]
+    int64_t offset) {
+  at::cuda::OptionalCUDAGuard device_guard(src_cache.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  TORCH_CHECK(src_cache.dim() == 3, "src_cache must be rank-3");
+  TORCH_CHECK(out.dim() == 3, "out must be rank-3 [B, T, 576]");
+  TORCH_CHECK(block_table.dim() == 2, "block_table must be rank-2");
+  TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be rank-1");
+  TORCH_CHECK(gather_lens.dim() == 1, "gather_lens must be rank-1");
+  TORCH_CHECK(workspace_starts.dim() == 1, "workspace_starts must be rank-1");
+
+  TORCH_CHECK(block_table.dtype() == torch::kInt32,
+              "block_table must be int32");
+  TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+  TORCH_CHECK(gather_lens.dtype() == torch::kInt32, "gather_lens must be int32");
+  TORCH_CHECK(workspace_starts.dtype() == torch::kInt32,
+              "workspace_starts must be int32");
+
+  TORCH_CHECK(src_cache.device() == out.device(),
+              "src_cache and out must be on the same device");
+  TORCH_CHECK(src_cache.device() == block_table.device(),
+              "src_cache and block_table must be on the same device");
+  TORCH_CHECK(src_cache.device() == seq_lens.device(),
+              "src_cache and seq_lens must be on the same device");
+  TORCH_CHECK(src_cache.device() == gather_lens.device(),
+              "src_cache and gather_lens must be on the same device");
+  TORCH_CHECK(src_cache.device() == workspace_starts.device(),
+              "src_cache and workspace_starts must be on the same device");
+
+  auto dtype = src_cache.scalar_type();
+  TORCH_CHECK(
+      dtype == at::ScalarType::Byte ||               // uint8
+          dtype == at::ScalarType::Float8_e4m3fn ||  // fp8 e4m3
+          dtype == at::ScalarType::Float8_e5m2,      // fp8 e5m2
+      "src_cache must be uint8, float8_e4m3fn, or float8_e5m2, but got ",
+      src_cache.dtype());
+  TORCH_CHECK(out.dtype() == torch::kBFloat16, "out must be bfloat16");
+  TORCH_CHECK(out.size(2) == 512, "out last dim must be 512 for DSV4 gather");
+  TORCH_CHECK(offset >= 0, "offset must be non-negative");
+
+  const int32_t num_reqs = block_table.size(0);
+  TORCH_CHECK(seq_lens.size(0) == num_reqs,
+              "seq_lens size must match batch size");
+  TORCH_CHECK(gather_lens.size(0) == num_reqs,
+              "gather_lens size must match batch size");
+  TORCH_CHECK(workspace_starts.size(0) == num_reqs,
+              "workspace_starts size must match batch size");
+  TORCH_CHECK(out.size(0) == num_reqs, "out batch size mismatch");
+
+  const int32_t block_size = src_cache.size(1);
+  const int64_t block_table_stride = block_table.stride(0);
+  const int64_t cache_block_stride = src_cache.stride(0);
+  const int64_t out_stride0 = out.stride(0);
+  const int64_t out_stride1 = out.stride(1);
+
+  const int32_t total_tokens = gather_lens.sum().item<int32_t>();
+  const int32_t max_gather_len = gather_lens.max().item<int32_t>();
+  TORCH_CHECK(offset + max_gather_len <= out.size(1),
+              "offset + max(gather_lens) exceeds out.shape[1]");
+
+  if (total_tokens == 0) return;
+
+  const uint8_t* src_ptr = nullptr;
+  if (dtype == at::ScalarType::Byte) {
+    src_ptr = src_cache.data_ptr<uint8_t>();
+  } else {
+    src_ptr = reinterpret_cast<const uint8_t*>(src_cache.data_ptr());
+  }
+
+  constexpr int warps_per_block = 8;
+  const int grid_size = (total_tokens + warps_per_block - 1) / warps_per_block;
+  const int block_size_threads = warps_per_block * 32;  // 256 threads
+
+  vllm::cp_gather_and_upconvert_fp8_kv_cache_windowed<<<grid_size,
+                                                         block_size_threads, 0,
+                                                         stream>>>(
+      src_ptr, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      block_table.data_ptr<int32_t>(), seq_lens.data_ptr<int32_t>(),
+      gather_lens.data_ptr<int32_t>(), workspace_starts.data_ptr<int32_t>(),
+      num_reqs, block_size, total_tokens, block_table_stride, cache_block_stride,
+      out_stride0, out_stride1, static_cast<int32_t>(offset));
 }
 
 // Macro to dispatch the kernel based on the data type.

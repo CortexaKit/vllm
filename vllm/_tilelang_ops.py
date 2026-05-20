@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,31 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
+
+
+def _tilelang_pdl_enabled() -> bool:
+    # PDL is only supported on Hopper+ (sm90+). Ada sm89 must disable it.
+    force_disable = os.getenv("VLLM_TILELANG_DISABLE_PDL", "0") == "1"
+    if force_disable:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 9
+
+
+_USE_TILELANG_PDL = _tilelang_pdl_enabled()
+
+
+def _pdl_sync():
+    if _USE_TILELANG_PDL:
+        T.pdl_sync()
+
+
+def _pdl_trigger():
+    if _USE_TILELANG_PDL:
+        T.pdl_trigger()
+
 
 # tilelang is only available on CUDA platforms
 if TYPE_CHECKING or current_platform.is_cuda():
@@ -78,7 +104,7 @@ def mhc_pre_big_fuse_tilelang(
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]  # type: ignore[no-redef, valid-type]
 
     with T.Kernel(num_tokens, threads=96) as i:
-        T.pdl_sync()
+        _pdl_sync()
         ##################################################################
         # _pre_norm_fn_fwd_norm
         rms = T.alloc_fragment(1, T.float32)
@@ -125,7 +151,7 @@ def mhc_pre_big_fuse_tilelang(
                 cm[j, k] = T.exp(cm[j, k] - row_max[j])
             T.reduce_sum(cm, row_sum, dim=1)
             for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
+                cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps) + hc_sinkhorn_eps
 
             # comb = comb / (comb.sum(-2) + eps)
             T.reduce_sum(cm, col_sum, dim=0)
@@ -174,7 +200,7 @@ def mhc_pre_big_fuse_tilelang(
                         ol[i1_h] += pre * xl[i_hc, i1_h]
 
                 T.copy(ol, layer_input[i, i0_h * hidden_block])
-        T.pdl_trigger()
+        _pdl_trigger()
 
 
 @tilelang.jit(
@@ -240,7 +266,7 @@ def mhc_fused_tilelang(
         T.clear(sqr)
         h_split_start = i_ks * h_per_split
 
-        T.pdl_sync()
+        _pdl_sync()
 
         T.copy(post_mix[i_n, 0], s_post)
         T.copy(comb_mix[i_n, 0, 0], s_comb)
@@ -299,7 +325,7 @@ def mhc_fused_tilelang(
                     v2 += s_warp[w, tile_n]
                 rp_out[i_ks, i_n] = v2
 
-        T.pdl_trigger()
+        _pdl_trigger()
 
 
 @tilelang.jit(
@@ -341,7 +367,7 @@ def mhc_post_tilelang(
 
         a_local = T.alloc_fragment((hc, hc), T.float32)
         c_local = T.alloc_fragment(hc, T.float32)
-        T.pdl_sync()
+        _pdl_sync()
         T.copy(a[i_n, 0, 0], a_local)
         T.copy(c[i_n, 0], c_local)
 
@@ -358,7 +384,7 @@ def mhc_post_tilelang(
             T.copy(x_local, x_shared)
 
             T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
-        T.pdl_trigger()
+        _pdl_trigger()
 
 
 @tilelang.jit(
@@ -401,7 +427,7 @@ def hc_head_fuse_tilelang(
     out: T.Tensor[[num_tokens, hidden_size], T.bfloat16]  # type: ignore[no-redef,valid-type]
 
     with T.Kernel(num_tokens, threads=n_thr) as i:
-        T.pdl_sync()
+        _pdl_sync()
 
         # ------------------------------------------------------------------
         # Pass 1 – for each residual channel m_c and h_block:
@@ -459,4 +485,4 @@ def hc_head_fuse_tilelang(
 
             T.copy(ol, out[i, i0_h * h_block], disable_tma=True)
 
-        T.pdl_trigger()
+        _pdl_trigger()

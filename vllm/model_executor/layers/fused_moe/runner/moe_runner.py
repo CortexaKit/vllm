@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -188,6 +189,53 @@ def _unpack(
         return result
     else:
         return (None, result)
+
+
+def _maybe_validate_moe_route_inputs(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    if os.environ.get("VLLM_MOE_INPUT_CONTRACT_CHECK", "0") != "1":
+        return
+
+    num_tokens = hidden_states.shape[0]
+    num_experts = router_logits.shape[-1]
+    if router_logits.shape[0] != num_tokens:
+        raise RuntimeError(
+            f"MoE router tokens mismatch: hidden_states={hidden_states.shape}, "
+            f"router_logits={router_logits.shape}"
+        )
+    if topk_ids.shape != topk_weights.shape:
+        raise RuntimeError(
+            f"MoE topk shape mismatch: topk_ids={topk_ids.shape}, "
+            f"topk_weights={topk_weights.shape}"
+        )
+    if topk_ids.shape[0] != num_tokens:
+        raise RuntimeError(
+            f"MoE topk token count mismatch: topk_ids={topk_ids.shape}, "
+            f"hidden_states={hidden_states.shape}"
+        )
+    if not topk_ids.dtype.is_signed:
+        raise RuntimeError(f"MoE topk_ids must be signed, got {topk_ids.dtype}")
+    if topk_weights.dtype != torch.float32:
+        raise RuntimeError(
+            f"MoE topk_weights must be float32, got {topk_weights.dtype}"
+        )
+
+    min_id, max_id = torch.aminmax(topk_ids)
+    min_id_v = int(min_id.item())
+    max_id_v = int(max_id.item())
+    if min_id_v < -1 or max_id_v >= num_experts:
+        raise RuntimeError(
+            f"MoE topk_ids out of range: min={min_id_v}, max={max_id_v}, "
+            f"num_experts={num_experts}"
+        )
+    if not torch.isfinite(topk_weights).all():
+        raise RuntimeError("MoE topk_weights contains NaN/Inf")
+    if not torch.isfinite(hidden_states).all():
+        raise RuntimeError("MoE hidden_states contains NaN/Inf before experts")
 
 
 class MoERunner(MoERunnerInterface):
@@ -523,6 +571,12 @@ class MoERunner(MoERunnerInterface):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+            )
+            _maybe_validate_moe_route_inputs(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
             )
 
             # Passing shared_experts_input in case SharedExpertsOrder is

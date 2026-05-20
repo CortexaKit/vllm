@@ -1,6 +1,7 @@
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cub/cub.cuh>
 
 #include <ATen/ATen.h>
@@ -616,6 +617,26 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
 void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
              torch::Tensor& output)  // [num_tokens, hidden_size]
 {
+  TORCH_CHECK(input.is_cuda(), "moe_sum input must be CUDA");
+  TORCH_CHECK(output.is_cuda(), "moe_sum output must be CUDA");
+  TORCH_CHECK(input.dim() == 3, "moe_sum input must be [num_tokens, topk, hidden]");
+  TORCH_CHECK(output.dim() == 2, "moe_sum output must be [num_tokens, hidden]");
+  TORCH_CHECK(input.size(0) == output.size(0),
+              "moe_sum token mismatch: input.size(0)=", input.size(0),
+              ", output.size(0)=", output.size(0));
+  TORCH_CHECK(input.size(2) == output.size(1),
+              "moe_sum hidden mismatch: input.size(2)=", input.size(2),
+              ", output.size(1)=", output.size(1));
+  TORCH_CHECK(input.scalar_type() == output.scalar_type(),
+              "moe_sum dtype mismatch: input=", input.scalar_type(),
+              ", output=", output.scalar_type());
+
+  // Fallback to framework reduction for strided tensors to preserve correctness.
+  if (!input.is_contiguous() || !output.is_contiguous()) {
+    at::sum_out(output, input, 1);
+    return;
+  }
+
   const int hidden_size = input.size(-1);
   const auto num_tokens = output.numel() / hidden_size;
   const int topk = input.size(1);
@@ -632,6 +653,7 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
             output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
             hidden_size);
       });
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
 
     case 3:
@@ -640,6 +662,7 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
             output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
             hidden_size);
       });
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
 
     case 4:
@@ -648,6 +671,7 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
             output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
             hidden_size);
       });
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
 
     default:

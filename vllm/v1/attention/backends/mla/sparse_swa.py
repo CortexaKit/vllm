@@ -369,6 +369,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         }
         if num_decode_tokens == 0 or current_platform.is_rocm():
             return out
+        cap = current_platform.get_device_capability()
+        # FlashMLA metadata is Hopper+/Blackwell-only. Ada sm89 must avoid
+        # touching get_mla_metadata() to keep the DSV4 non-FlashMLA path alive.
+        if cap is not None and cap.major < 9:
+            return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
             # returns a fresh empty FlashMLASchedMeta; using it keeps this

@@ -4,7 +4,6 @@ import functools
 from math import prod
 
 import torch
-import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -434,18 +433,13 @@ def trtllm_moe_pack_topk_ids_weights(
     return output.reshape(original_shape)
 
 
-@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def swiglu_limit_func(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
     swiglu_limit: float = 0.0,
 ) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d]
-    up = input[:, d:]
-
+    # Prefer vLLM native CUDA ops to avoid Triton-poi instability on SM89.
     if swiglu_limit > 0:
-        gate = torch.clamp(gate, max=swiglu_limit)
-        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-
-    output.copy_(F.silu(gate) * up)
+        torch.ops._C.silu_and_mul_with_clamp(output, input, float(swiglu_limit))
+    else:
+        torch.ops._C.silu_and_mul(output, input)

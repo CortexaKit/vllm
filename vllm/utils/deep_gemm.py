@@ -89,6 +89,11 @@ def is_deep_gemm_supported() -> bool:
     Currently, only Hopper and Blackwell GPUs are supported.
     """
     is_supported_arch = current_platform.support_deep_gemm()
+    if not is_supported_arch and current_platform.is_cuda():
+        # Enable DeepGEMM experimental path on Ada sm89.
+        # Kernel-level guards still decide whether an op is runnable.
+        capability = torch.cuda.get_device_capability()
+        is_supported_arch = capability[0] == 8 and capability[1] == 9
     return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
 
 

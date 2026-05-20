@@ -35,7 +35,7 @@ class MHCPreOp(CustomOp):
         sinkhorn_repeat: int,
         n_splits: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.mhc_pre_tilelang(
+        post_mix, comb_mix, layer_input = torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
             hc_scale,
@@ -47,6 +47,7 @@ class MHCPreOp(CustomOp):
             sinkhorn_repeat,
             n_splits,
         )
+        return post_mix, comb_mix, layer_input
 
     def forward_hip(
         self,
